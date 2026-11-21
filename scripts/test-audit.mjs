@@ -33,6 +33,8 @@ const tests = [
   'test-motou.mjs',
   // 小程序/Ark 卡片（json 段）：剥转义层、B站链接优先、摘要回落、坏 JSON 不误判。
   'test-card-parse.mjs',
+  // GitHub 链接解析：仓库/Release/PR 形式、保留路径剔除、镜像前缀拼接。
+  'test-github-parse.mjs',
   // 安全（上游 4ed0142）：会话令牌被拆成多段时整批预检拦截，且日常聊天不误伤。
   'test-token-fragment.mjs',
   // 控制台远程访问：路径前缀剥离、域名白名单、DNS rebinding 防护。

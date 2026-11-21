@@ -31,6 +31,7 @@ import { parseBiliLink, fetchBiliMeta } from './bili-parse.js';
 import { renderBiliText, biliCoverUrl } from './bili-render.js';
 import { fetchMotouGif, motouImageSegment, normalizeQQ, parseMotouCommand } from './motou.js';
 import { cardReadableText } from './card-parse.js';
+import { parseGitHubRef, fetchOgCard, DEFAULT_MIRROR } from './github-parse.js';
 import { normalizePathPrefix, stripPathPrefix, checkConsoleHost } from './console-remote.js';
 import {
   hashPassword, verifyPassword, validatePasswordStrength, createSessionStore, createLoginLimiter,
@@ -869,6 +870,7 @@ function loadConfig() {
         sendPoke: true,
         recall: false,             // 撤回自己发的消息（PR #4；默认关闭）
         bili: false,               // B 站链接解析（群里发 BV 号/短链时回视频卡片；默认关闭）
+        github: true,              // GitHub 链接解析（仓库/Release/PR 链接回 OG 卡片；默认开启）
         motou: true,               // 摸头 GIF（群里发「摸头 @某人」或 AI 主动调用；默认开启）
         seeAvatar: true,           // 看某个人的 QQ 头像（进视觉上下文；只读）
         sendAvatar: true,          // 把头像当图片发到聊天
@@ -14010,6 +14012,53 @@ async function main() {
             log(`[bili] 自动触发但元信息解析失败 ${key} id=${biliHit.id}`);
           } catch (bErr) {
             log(`[bili] 自动触发异常 ${key}:`, bErr?.message ?? bErr);
+          }
+        }
+      }
+    }
+
+    // ── GitHub 链接自动解析（发仓库链接就回 OG 预览卡片，不走模型）────────────
+    // 和 B 站 / 摸头一样是固定触发：识别到就直接发图，不交给 AI 判断。
+    // 只发图，不带文字卡片 —— GitHub 自己的 OG 图里已经有仓库名、描述、统计。
+    if (!backfill && v2ToolEnabled('github')) {
+      let ghHit = null;
+      try { ghHit = parseGitHubRef(plainContent); } catch {}
+      if (ghHit) {
+        const gSt = getSocialV2State(key);
+        const gNow = Date.now();
+        const gCooldown = Number(cfg.socialV2?.github?.cooldownMs) || 20000;
+        const gLastId = gSt.githubLastId || '';
+        const gThisId = `${ghHit.owner}/${ghHit.repo}`;
+        const gLastAt = Number(gSt.githubLastAt) || 0;
+        // 冷却只拦「同一个仓库」重复刷屏；不同仓库照常出图。
+        const gSame = gLastId && gLastId.toLowerCase() === gThisId.toLowerCase();
+        if (!(gSame && gLastAt && gNow - gLastAt < gCooldown)) {
+          try {
+            const mirror = String(cfg.socialV2?.github?.mirror ?? DEFAULT_MIRROR);
+            const img = await fetchOgCard(ghHit.owner, ghHit.repo, { mirror });
+            if (img) {
+              const gSeg = { type: 'image', data: { file: 'base64://' + img.toString('base64') } };
+              const gAct = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
+              const gParams = kind === 'private'
+                ? { user_id: Number(id), message: [gSeg] }
+                : { group_id: Number(id), message: [gSeg] };
+              const gHttp = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+              await fetch(`${gHttp}/${gAct}`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {}) },
+                body: JSON.stringify(gParams),
+                signal: AbortSignal.timeout(30000)
+              });
+              gSt.githubLastAt = gNow;
+              gSt.githubLastId = gThisId;
+              saveSocialV2State();
+              log(`[github] 自动触发 ${key} 出图 ${gThisId} (${Math.round(img.length / 1024)} KB)`);
+              appendActivity(`${key} GitHub卡片 ${gThisId}`);
+              return;
+            }
+            log(`[github] 识别到 ${gThisId} 但抓图失败`);
+          } catch (gErr) {
+            log(`[github] 自动触发异常 ${key}:`, gErr?.message ?? gErr);
           }
         }
       }
