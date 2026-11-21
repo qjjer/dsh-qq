@@ -1,6 +1,6 @@
 # QQ ↔ DeepSeek Harness 桥接
 
-**支持系统：Windows · macOS · Linux**（qq-bridge-enhanced v1.1.2 · 仓库 <https://github.com/h-D-ACE/dsh-qq>）
+**支持系统：Windows · macOS · Linux**（qq-bridge-enhanced v1.1.2 · 本仓库 <https://github.com/qjjer/dsh-qq>）
 
 **English**: [README.en.md](README.en.md) | **中文**: [README.md](README.md)
 
@@ -14,12 +14,177 @@
 
 ---
 
+## 🍴 本仓库（qjjer/dsh-qq）新增内容
+
+> 本仓库 fork 自 [h-D-ACE/dsh-qq](https://github.com/h-D-ACE/dsh-qq)，
+> 在其实验基础上追加了下面这批功能。上游原有功能与文档全部保留，请继续参考下文。
+
+| 功能 | 一句话说明 | 实现 |
+| --- | --- | --- |
+| **B 站链接自动解析** | 群里发 BV 号 / av 号 / b23.tv 短链，自动回一张「封面 + 标题 + UP主 + 七项数据」的卡片，不经过模型判断 | `src/bili-parse.js` · `src/bili-render.js` |
+| **摸头 GIF** | 群里发「摸头 @某人」/「摸摸头」/「petpet」/「rua」，用对方 QQ 头像生成被摸头的动图 | `src/motou.js` |
+| **小程序卡片解析** | QQ 小程序的 `json` 消息段不再只显示 `[卡片消息]`，会解出可读文字和链接（因此 B 站小程序也能被识别） | `src/card-parse.js` |
+| **控制台远程访问** | 通过 cloudflared 等隧道暴露控制台：路径前缀 + 域名白名单双保险，不带前缀对外返回 404（不暴露「这里有个控制台」） | `src/console-remote.js` |
+| **短密码登录** | 远程访问时不必手抄 48 位 consoleToken：用自设密码换取 HttpOnly 会话 Cookie，浏览器记住 7 天；scrypt 存储、失败限流、换密码即踢下线 | `src/console-auth.js` · `scripts/set-console-password.mjs` |
+| **会话迁移工具** | 换机器 / 换路径时，把 `~/.dsh/sessions` 里的工作区目录名和每个会话首行的 `cwd` 一起改写，历史对话不丢 | `scripts/migrate-sessions.mjs` |
+| **令牌拆分防护** | 把上游 `4ed0142` 的安全修复移植过来：发送前按「整批拼接」预检，防止把会话令牌拆成多条消息绕过逐条闸门 | `src/bridge.js` |
+
+### B 站解析
+
+**支持的形式**：`BV1xx411c7mD` / `av170001` / `https://www.bilibili.com/video/BV...` / `https://b23.tv/xxxxx` / `bilibili.com` 小程序卡片。
+
+**输出**（封面走图片消息，文本三行起）：
+
+```
+视频标题：xxxxx
+UP主：xxxxx
+▶️播放：1.1亿
+👍点赞：297万
+💰投币：129万
+⭐收藏：156万
+📢弹幕：15万
+💬评论：24万
+🔗分享：51万
+——————————
+https://www.bilibili.com/video/BVxxxx
+```
+
+字段来源：优先 uapis 聚合接口（`uapis.cn`），失败回落 B 站官方 `x/web-interface/view`。
+数字按万 / 亿折算；封面抓取失败时只发文字，不影响整条解析。
+
+**冷却**：同一会话里重复解析**同一个视频**会跳过（防刷屏），解析**不同视频**不受限制。
+可用 `socialV2.bili.cooldownMs`（默认 20000 毫秒）调整。
+
+### 摸头 GIF
+
+在群/私聊里发任意一条：
+
+```
+摸头 @某人
+摸摸头 @某人
+petpet @某人
+rua @某人
+摸头 1234567890     ← 也接受直接写 QQ 号
+```
+
+由第三方接口 `uapis.cn/api/v1/image/motou` 生成，返回 GIF 动图。
+指令词必须出现在**消息开头**才触发（避免聊天里随口提到就发图）；`@全体成员` 不会触发。
+默认 10 秒冷却（`socialV2.motou.cooldownMs`）。
+
+### 控制台远程访问
+
+场景：出门在外想用手机看桥接状态，或者临时改配置。
+
+**1）配置**（`config.json`）：
+
+```json
+"console": {
+  "pathPrefix": "admin",
+  "allowRemoteHosts": ["qb.example.com"]
+}
+```
+
+**2）隧道**：把域名转发到 `127.0.0.1:3100`，例如：
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:3100
+```
+
+**3）访问**：`https://qb.example.com/admin/`
+
+**行为**：
+
+| 场景 | 结果 |
+| --- | --- |
+| 本机 `http://127.0.0.1:3100/` | 200（原有方式不变） |
+| 域名 + 前缀 | 200（需登录） |
+| 域名**不带**前缀 | 404（不暴露控制台存在） |
+| 未配置的域名 | 403 |
+
+**安全说明**：路径前缀**不是密码**，它只挡随手扫到域名的人。真正的鉴权仍是 consoleToken 或下面的短密码。
+
+### 短密码登录
+
+consoleToken 是 48 位随机串、存在本机 `state/console-token`。人不在电脑边时读不到它，
+所以提供一条替代路径：用自己设的短密码登录。
+
+**设置密码**：
+
+```bash
+node scripts/set-console-password.mjs
+```
+
+交互式输入（推荐，不留在命令历史里）；密码至少 8 位、不能纯数字、不能单字符重复。
+
+**特性**：
+
+- 密码**不落盘**：`config.json` 里只存 `scrypt(salt)` 的派生结果
+- 登录后签发 `HttpOnly` + `SameSite=Strict` 会话 Cookie，浏览器记住 7 天
+- 同一 IP 连续 5 次失败锁定 15 分钟
+- 重设密码会轮换会话密钥，**所有旧会话立即失效**
+
+> ⚠️ 短密码强度低于 48 位随机 token。远程暴露控制台时建议再叠一层 Cloudflare Access（邮箱验证码）。
+
+### 会话迁移
+
+换机器或换工作区路径时，DSH 的历史对话会「找不到」——因为：
+
+1. 会话目录名是**编码后的绝对路径**（`D:\65383\Documents\dsh` → `--D-65383-Documents-dsh--`）
+2. 每个 `session.v4.jsonl.zstd` 首行还写死了 `{"cwd":"D:\\65383\\..."}`
+
+这个工具把两处一起改写：
+
+```bash
+node scripts/migrate-sessions.mjs -from "D:\65383\Documents\dsh" -to "D:\dsh" \
+  -src sessions-backup -out sessions-migrated
+```
+
+| 参数 | 说明 |
+| --- | --- |
+| `-from` | 旧工作区绝对路径（必填） |
+| `-to` | 新工作区绝对路径（必填） |
+| `-src` | 输入 sessions 目录（默认 `sessions-backup`） |
+| `-out` | 输出目录（默认 `sessions-migrated`，会先清空） |
+| `-dry` | 只打印计划，不写文件 |
+
+> 用单横线 `-from`。写成 `--from` 需要加 `--` 分隔（`node script -- --from ...`），否则会被 Node 当成自己的参数。
+
+只改写「cwd 确实指向旧路径」的会话；`sessions/` 里混着的临时目录、其它项目会话保持原样。
+
+### 测试
+
+本轮新增 5 个测试文件，均无网络依赖：
+
+```bash
+npm run test:audit          # 全量（含下面这些）
+
+node scripts/test-bili-parse.mjs       # B 站解析：正则、万/亿折算、排版、封面协议
+node scripts/test-motou.mjs            # 摸头：QQ 号校验、@ 段优先、指令词变体
+node scripts/test-card-parse.mjs       # 卡片：剥转义层、B 站链接优先、坏 JSON 不误判
+node scripts/test-console-remote.mjs   # 远程访问：前缀剥离、域名白名单、DNS rebinding
+node scripts/test-console-auth.mjs     # 短密码：scrypt、会话签发/校验/吊销、失败限流
+node scripts/test-token-fragment.mjs   # 令牌拆分：整批预检、日常聊天不误伤
+node scripts/test-migrate-sessions.mjs # 迁移：目录名编码、cwd 改写、范围隔离
+```
+
+### 相关改动位置
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/bridge.js` | `handleIncoming` 里加 B 站 / 摸头自动触发；`segmentsToText` 的 `json` 分支改走卡片解析；控制台的路径前缀 / 域名白名单 / CSRF Origin 白名单；`sendMessagesV2` 加整批令牌预检 |
+| `src/mcp-snowluma-safe.js` | 注册 `qq_bili`、`qq_motou` 两个工具 |
+| `scripts/test-audit.mjs` | 登记 5 个新测试 |
+
+---
+
 ## 🆕 增强版（qq-bridge-enhanced v1.1.2）—— 支持 Windows、macOS、Linux
 
-> 本仓库（<https://github.com/h-D-ACE/dsh-qq>）是 [Derpyu520/qq-bridge](https://github.com/Derpyu520/qq-bridge) v0.2.0-r3 的二次开发版本（来源与授权见 [NOTICE.md](NOTICE.md)），已合并上游 r4 的修复。
+> **来源链**：[Derpyu520/qq-bridge](https://github.com/Derpyu520/qq-bridge) v0.2.0-r3
+> → [h-D-ACE/dsh-qq](https://github.com/h-D-ACE/dsh-qq)（二次开发，已合并上游 r4）
+> → **本仓库**（在此基础上追加功能，见下方表格）。来源与授权见 [NOTICE.md](NOTICE.md)。
 > 原版的全部功能（消息桥接、多群白名单、reserved2 二代仿真、QQ 自主工具、人格、控制台、安全守卫、令牌统计、MCP、SnowLuma 健康检查）保持不变；
 > 下文「架构」之后的内容沿用上游文档并按本仓库现状更新过，仍然适用（部署请以本节和 [docs/DSH_DEPLOYMENT.md](docs/DSH_DEPLOYMENT.md) 为准）。
-> 问题反馈与 Release 下载请到本仓库：[Issues](https://github.com/h-D-ACE/dsh-qq/issues) · [Releases](https://github.com/h-D-ACE/dsh-qq/releases)。
+> 问题反馈请到本仓库 [Issues](https://github.com/qjjer/dsh-qq/issues)；Release 仍以上游 [h-D-ACE/dsh-qq/releases](https://github.com/h-D-ACE/dsh-qq/releases) 为准。
 
 | 新功能 | 一句话 | 文档 |
 | --- | --- | --- |
@@ -101,7 +266,7 @@ NapCat 要在它的 WebUI 里开启 WebSocket 服务端 `127.0.0.1:3001`）。�
 > [`v0.1.5`](https://github.com/Derpyu520/qq-bridge/releases/tag/v0.1.5)；**DSH 0.1.7-rc.2** 用
 > [`v0.1.7`](https://github.com/Derpyu520/qq-bridge/releases/tag/v0.1.7)（这些是原版仓库的旧版本，本仓库不再维护）。
 >
-> 本仓库默认分支 `main` **就是**最新版本，`git clone https://github.com/h-D-ACE/dsh-qq.git` 直接拿到，无需切换分支；也可以下载 [Release ZIP](https://github.com/h-D-ACE/dsh-qq/releases)。
+> 本仓库默认分支 `main` **就是**最新版本，`git clone https://github.com/qjjer/dsh-qq.git` 直接拿到，无需切换分支；也可以下载 [Release ZIP](https://github.com/h-D-ACE/dsh-qq/releases)。
 
 ```
 QQ 消息 ──► SnowLuma / NapCat（OneBot v11 WS，可经接口平台）──► 本桥接进程 ──► DSH Web API（命令行版 127.0.0.1:3080 / 桌面版自动识别）
@@ -213,7 +378,7 @@ node scripts/setup-dsh.mjs
 
 2. **装桥接并复制配置**
    ```bash
-   git clone https://github.com/h-D-ACE/dsh-qq.git
+   git clone https://github.com/qjjer/dsh-qq.git
    cd dsh-qq
    npm ci
    ```

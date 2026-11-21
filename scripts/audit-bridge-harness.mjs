@@ -28,6 +28,10 @@ import { describeInstant } from '../src/scheduler/time.js';
 import { createSilenceSchedule, peakPresetRanges, describeRange, DIRECT_PASS_MS } from '../src/silence-schedule.js';
 import * as roleRefreshLib from '../src/role-refresh.js';
 import * as stickerDescribeLib from '../src/sticker-describe.js';
+import * as motouLib from '../src/motou.js';
+import * as biliParseLib from '../src/bili-parse.js';
+import * as biliRenderLib from '../src/bili-render.js';
+import * as cardParseLib from '../src/card-parse.js';
 import * as webImageLib from '../src/web-image.js';
 import * as tokenGuardLib from '../src/agent-token-guard.js';
 import * as promptBlocksLib from '../src/prompt-blocks.js';
@@ -216,6 +220,9 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     discoverDshLaunchToken: () => '', resolveDshHome: () => path.join(os.tmpdir(), 'qq-bridge-audit-no-dsh-home'), unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker, ...stickerLimits,
     ...modelPrices, ...dshModel, ...quoteForward, ...modeHandover, ...roleCard, ...tokenLedger,
+    // 本地新增模块（摸头 / B站 / 小程序卡片）：测试 VM 没有真实 import，必须显式注入，
+    // 否则 bridge.js 里调用 parseMotouCommand / cardReadableText 会 ReferenceError。
+    ...motouLib, ...biliParseLib, ...biliRenderLib, ...cardParseLib,
     createScheduler, parseRemindCommand, REMIND_HELP, formatTaskList, createScheduledNoteStore, scheduledPromptBlock, scheduledDirectPrompt, describeInstant, createSilenceSchedule, peakPresetRanges, describeRange, DIRECT_PASS_MS, ...roleRefreshLib, ...stickerDescribeLib, ...webImageLib, ...tokenGuardLib, ...promptBlocksLib, ...autoCompactLib, ...defaultRolesLib, ...backfillLib, ...rolePerKeyLib, ...dshAuthHintLib, ...ownerAccountLib, ACCOUNT_LIMITS: ownerAccountLib.LIMITS, ...ttsCloudLib, ...voiceLib, ...stateAcl, ...presetPrompt, ...bridgeExt,
     // ACL 收紧会 spawn icacls 去改**真实**文件系统；测试不该做这件事（同理见下面的
     // cleanupTemp / processAudioVolume 桩）。桩成成功，让 hardenStateDirAcl 走正常分支。

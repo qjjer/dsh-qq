@@ -27,6 +27,18 @@ const tests = [
   // （DSH 同一路 DeepSeek 搜索、Bing RSS 兜底、凭据优先级与端点安全；
   //  本轮新增：空结果 note 必须在写缓存之前生成，否则缓存命中丢掉提示）。
   'test-media-search.mjs',
+  // B 站链接解析与排版：万/亿折算边界、时长兼容字符串、三行结构、封面不进文本。
+  'test-bili-parse.mjs',
+  // 摸头 GIF：QQ 号校验、@ 段优先、指令词变体、只在开头触发。
+  'test-motou.mjs',
+  // 小程序/Ark 卡片（json 段）：剥转义层、B站链接优先、摘要回落、坏 JSON 不误判。
+  'test-card-parse.mjs',
+  // 安全（上游 4ed0142）：会话令牌被拆成多段时整批预检拦截，且日常聊天不误伤。
+  'test-token-fragment.mjs',
+  // 控制台远程访问：路径前缀剥离、域名白名单、DNS rebinding 防护。
+  'test-console-remote.mjs',
+  // 控制台短密码登录：scrypt 存储、会话 Cookie 签发/校验/吊销、登录失败限流。
+  'test-console-auth.mjs',
   // GitHub issue 回归：#22 模式 user 层优先 / #11/#19 回合判忙租约 / #29 机器人身份注入。
   'test-issue-regressions.mjs',
   // 二代「会话初始提示词」：只在首次唤醒注入、管理面隔离、损坏文件只读降级、

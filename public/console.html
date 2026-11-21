@@ -3088,12 +3088,38 @@ button:active:not(:disabled) {
   }
 })();
 
+// 是否通过密码登录（服务端会下发 HttpOnly Cookie）。这个标记只用于前端行为分支，
+// 不含任何凭据：真正的鉴权靠 Cookie 本身。
+let consoleUsesPasswordLogin = window.__QB_PASSWORD_LOGIN__ === true;
+
+// 当前控制台的路径前缀（远程访问时是 '/admin'，本机直连时是 ''）。
+// 所有 API 路径都要带上它，否则远程会打到 /api/* 而不是 /admin/api/*。
+const QB_PATH_PREFIX = (function () {
+  const p = location.pathname;             // '/admin/' 或 '/'
+  if (!p || p === '/') return '';
+  const seg = p.split('/').filter(Boolean)[0];
+  // 已知前端路由都是 '/' 或 '/<prefix>/'；取第一段作为前缀
+  return seg ? '/' + seg : '';
+})();
+
 async function api(path, method, body, _retried = 0) {
+  // 统一补前缀：传进来是 '/api/xxx'，实际请求 '/admin/api/xxx'
+  if (QB_PATH_PREFIX && path.startsWith('/api/')) {
+    path = QB_PATH_PREFIX + path;
+  }
   const headers = body ? {'content-type':'application/json'} : {};
   const token = localStorage.getItem('consoleToken');
   if (token) headers['x-console-token'] = token;
-  const res = await fetch(path, { method: method || 'GET', headers, body: body ? JSON.stringify(body) : undefined });
+  // 密码登录模式下凭据在 HttpOnly Cookie 里，浏览器会自动带上；显式声明 credentials
+  // 是为了让反代（cloudflared）场景下也不会丢。
+  const res = await fetch(path, { method: method || 'GET', headers, credentials: 'same-origin', body: body ? JSON.stringify(body) : undefined });
   if (res.status === 401) {
+    // 密码登录模式：会话过期了，直接回登录页重新输密码，不要弹"访问令牌"框 ——
+    // 远程用户根本不知道令牌是什么（那是本机文件里的 48 位随机串）。
+    if (consoleUsesPasswordLogin) {
+      location.href = QB_PATH_PREFIX + '/login';
+      throw new Error('登录已过期，正在跳转登录页');
+    }
     if (_retried >= 2) {
       localStorage.removeItem('consoleToken');
       throw new Error('未授权');

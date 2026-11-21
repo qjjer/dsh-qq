@@ -27,6 +27,15 @@ import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, in
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
+import { parseBiliLink, fetchBiliMeta } from './bili-parse.js';
+import { renderBiliText, biliCoverUrl } from './bili-render.js';
+import { fetchMotouGif, motouImageSegment, normalizeQQ, parseMotouCommand } from './motou.js';
+import { cardReadableText } from './card-parse.js';
+import { normalizePathPrefix, stripPathPrefix, checkConsoleHost } from './console-remote.js';
+import {
+  hashPassword, verifyPassword, validatePasswordStrength, createSessionStore, createLoginLimiter,
+  readCookie, buildSessionCookie, buildClearCookie, loginPageHtml, DEFAULT_SESSION_TTL_MS
+} from './console-auth.js';
 import {
   createSlowFetchCache,
   pendingReplyText,
@@ -761,6 +770,21 @@ function loadConfig() {
     questionTimeoutMs: file.questionTimeoutMs ?? 5 * 60 * 1000,
     consolePort: file.consolePort ?? 3100,
     consoleToken: file.consoleToken ?? '',
+    // 控制台远程访问（cloudflared / 反代）：路径前缀 + 允许的外部域名。
+    // 不配 pathPrefix 时行为与以前完全一致（只认本机回环 Host）。
+    console: {
+      pathPrefix: file.console?.pathPrefix ?? '',
+      allowRemoteHosts: Array.isArray(file.console?.allowRemoteHosts) ? file.console.allowRemoteHosts : [],
+      // 短密码登录：salt/hash 由 scripts/set-console-password.mjs 生成并写入，明文不落盘。
+      auth: {
+        salt: file.console?.auth?.salt ?? '',
+        hash: file.console?.auth?.hash ?? '',
+        sessionSecret: file.console?.auth?.sessionSecret ?? '',
+        sessionTtlMs: file.console?.auth?.sessionTtlMs ?? 0,
+        maxFailures: file.console?.auth?.maxFailures ?? 0,
+        lockoutMs: file.console?.auth?.lockoutMs ?? 0
+      }
+    },
     // 价目表覆盖项（可选）。留空即用 src/model-prices.js 的官方默认价。
     pricing: file.pricing ?? null,
     security: {
@@ -844,6 +868,11 @@ function loadConfig() {
         getForwardMsg: true,
         sendPoke: true,
         recall: false,             // 撤回自己发的消息（PR #4；默认关闭）
+        bili: false,               // B 站链接解析（群里发 BV 号/短链时回视频卡片；默认关闭）
+        motou: true,               // 摸头 GIF（群里发「摸头 @某人」或 AI 主动调用；默认开启）
+        seeAvatar: true,           // 看某个人的 QQ 头像（进视觉上下文；只读）
+        sendAvatar: true,          // 把头像当图片发到聊天
+        setAvatar: false,          // 改机器人自己的头像（不可逆，默认关闭）
         listStickers: true,
         getStickerImage: true,
         sendSticker: true,
@@ -1441,7 +1470,13 @@ async function segmentsToText(segments, options = {}) {
         out.push(replyText || '[引用消息]');
         break;
       }
-      case 'json': out.push('[卡片消息]'); break;
+      case 'json': {
+        // 小程序 / Ark 卡片：原来只输出字面量 `[卡片消息]`，把卡片里的链接整个丢掉了
+        // —— 别人发的 B 站小程序因此解析不了。这里把卡片解出可读文字 + 链接。
+        const cardText = cardReadableText(d);
+        out.push(cardText || '[卡片消息]');
+        break;
+      }
       // markdown：SnowLuma 1.14.9 的线上段落是 `{type:'markdown',data:{content}}`。
       // 上游 1.14.17+（commit 1934e4e7「include text alongside received markdown」）
       // 起还会带上 `data.text`。两个形状都读，这样将来升级 SnowLuma 运行时不会退化成
@@ -4463,12 +4498,60 @@ async function main() {
     };
     // 二代会话工具必须仍命中当前模式的白名单/准入；避免白名单移除后旧 agentToken 继续读状态。
     const v2SessionAllowed = isSessionAllowedInCurrentMode;
+    // ── 短密码登录（见 src/console-auth.js）──────────────────────────────────
+    // 解决的问题：consoleToken 是 48 位随机串，存在本机文件里；人不在电脑边时读不到，
+    // 远程访问就成了死结。密码登录让「记住一次密码」替代「每次抄 token」。
+    // 安全取舍：短密码强度低于随机 token，因此配了失败限流 + scrypt 存储 + HttpOnly Cookie。
+    const authCfg = (cfg.console && cfg.console.auth) || {};
+    const passwordSalt = authCfg.salt || '';
+    const passwordHash = authCfg.hash || '';
+    const passwordEnabled = Boolean(passwordSalt && passwordHash);
+    const sessionTtlMs = Number(authCfg.sessionTtlMs) || DEFAULT_SESSION_TTL_MS;
+    const sessionCookieName = 'qb_console_session';
+    const sessionStore = createSessionStore({ ttlMs: sessionTtlMs, secret: authCfg.sessionSecret || consoleToken });
+    const loginLimiter = createLoginLimiter({ maxFailures: Number(authCfg.maxFailures) || 5, windowMs: Number(authCfg.lockoutMs) || 15 * 60 * 1000 });
+    // pathPrefix 在请求处理内部才算出，因此这里不能提前求值。
+    // 登录/登出路径在请求内按当前前缀拼（见 loginPathFor / logoutPathFor 的使用处）。
+    if (passwordEnabled) log('控制台已启用密码登录（可用密码替代 token 进入）');
+
     const server = http.createServer(async (req, res) => {
       let url;
       try { url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`); }
       catch {
         res.writeHead(400, { 'content-type': 'application/json; charset=utf-8', 'Connection': 'close' });
         res.end(JSON.stringify({ ok: false, error: '无效的请求地址' }));
+        return;
+      }
+      // ── 远程访问：路径前缀 + 域名白名单（见 src/console-remote.js）────────────
+      // 配置：config.json → console.pathPrefix / console.allowRemoteHosts
+      // 语义：带了 /<prefix> 前缀才可能是外部域名访问；本机回环不受影响。
+      const remoteCfg = cfg.console ?? {};
+      const pathPrefix = normalizePathPrefix(remoteCfg.pathPrefix);
+      // 登录/登出地址按当前前缀拼（本机无前缀时是 /login）
+      const loginPathFor = (prefix) => (prefix ? `/` + prefix + `/login` : '/login');
+      const logoutPathFor = (prefix) => (prefix ? `/` + prefix + `/logout` : '/logout');
+      const hostHeaderEarly = String(req.headers.host ?? '');
+      let prefixMatched = false;
+      let effectivePath = url.pathname;
+      if (pathPrefix) {
+        const stripped = stripPathPrefix(url.pathname, pathPrefix);
+        if (stripped !== null) {
+          prefixMatched = true;
+          effectivePath = stripped;
+          url.pathname = stripped;
+        }
+      }
+      const hostCheck = checkConsoleHost({
+        hostHeader: hostHeaderEarly,
+        port: server.address()?.port ?? port,
+        prefixMatched,
+        allowRemoteHosts: Array.isArray(remoteCfg.allowRemoteHosts) ? remoteCfg.allowRemoteHosts : []
+      });
+      if (!hostCheck.ok) {
+        // 前缀不匹配时对外**返回 404**（而不是 403）：不泄露"这里有个控制台"。
+        const status = prefixMatched || !pathPrefix ? 403 : 404;
+        res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'Connection': 'close' });
+        res.end(JSON.stringify({ ok: false, error: status === 404 ? 'Not Found' : hostCheck.reason }));
         return;
       }
       const SECURITY_HEADERS = {
@@ -4544,20 +4627,96 @@ async function main() {
         res.end();
         return;
       }
-      // Host 头校验（DNS rebinding 硬化）：控制台只监听 127.0.0.1，因此合法请求的 Host
-      // 只可能是 127.0.0.1 / localhost / [::1] 加本端口。攻击者用一个 TTL=0 的域名解析到
-      // 127.0.0.1 时，浏览器会把 evil.com:3100 当作同源，Origin 校验随之失效；卡住 Host
-      // 这一层后，这类请求在进入任何业务分支之前就被拒掉。
-      // 反代/端口转发场景会被一并拒绝——这是有意的（要远程访问请用 SSH 隧道并自行承担）。
-      const hostHeader = String(req.headers.host ?? '');
-      // 用**实际绑定端口**而不是配置值：测试夹具用 consolePort: 0 让系统分配端口，
-      // 配置里那个 0 不是请求里的 Host 端口。请求必然发生在 listen 之后，所以这里拿得到。
-      const boundPort = server.address()?.port ?? port;
-      const allowedHosts = [`127.0.0.1:${boundPort}`, `localhost:${boundPort}`, `[::1]:${boundPort}`];
-      if (!allowedHosts.includes(hostHeader.toLowerCase())) {
-        sendJson({ ok: false, error: `Host 头不被允许（${hostHeader || '缺失'}）：控制台只接受本机回环访问` }, 403);
+      // Host 头校验已前移到 URL 解析之后（见上方「远程访问」段）。
+      // 那里同时处理路径前缀与域名白名单，理由：
+      //   · 旧实现只认回环 Host，会把 cloudflared/反代一并拒掉；
+      //   · 新实现允许配置的域名，但**必须**带路径前缀 —— 前缀缺失时对外返回 404，
+      //     不泄露"这里有个控制台"。
+      // DNS rebinding 仍然被挡住：攻击者的域名不在 allowRemoteHosts 里，且没有前缀。
+      // Cookie 是否加 Secure：只有 https 的来源才加（cloudflared 是 https，
+      // 本机 http 访问不能加，否则浏览器会丢弃 Cookie）。
+      const hostHeaderForCookie = String(req.headers.host ?? '').split(':')[0].toLowerCase();
+      // 是否 https：优先看反代传来的 x-forwarded-proto；
+      // 其次看 Host 是不是 console.allowRemoteHosts 里配置的远程域名——
+      // 那种情况一定是走了隧道/反代（本机回环不在该列表里）。
+      // 之前这里硬编码了某个具体域名，既泄露隐私，也让代码只能在一个部署里用。
+      const remoteHostsForCookie = Array.isArray(remoteCfg.allowRemoteHosts) ? remoteCfg.allowRemoteHosts : [];
+      const isConfiguredRemoteHost = remoteHostsForCookie.some(
+        (h) => String(h ?? '').toLowerCase().trim() === hostHeaderForCookie
+      );
+      const isHttpsRequest = String(req.headers['x-forwarded-proto'] ?? '').toLowerCase() === 'https'
+        || isConfiguredRemoteHost;
+
+      // ── 登录 / 登出路由（路径前缀已被剥离，这里用剥离后的 pathname）────────
+      // POST /login  提交密码 → 签发会话 Cookie → 302 回首页
+      // GET  /login  渲染登录表单
+      // POST /logout 清除 Cookie
+      if (passwordEnabled && req.method === 'GET' && url.pathname === '/login') {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
+        res.end(loginPageHtml({ action: loginPathFor(pathPrefix) }));
         return;
       }
+      if (passwordEnabled && req.method === 'POST' && url.pathname === '/login') {
+        const ip = req.socket?.remoteAddress ?? 'unknown';
+        const limit = loginLimiter.allowed(ip);
+        if (!limit.ok) {
+          const mins = Math.ceil((limit.retryAfterMs || 0) / 60000);
+          res.writeHead(429, { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
+          res.end(loginPageHtml({ action: loginPathFor(pathPrefix), error: `尝试次数过多，请 ${mins} 分钟后再试` }));
+          return;
+        }
+        // 表单是 application/x-www-form-urlencoded（不是 JSON），必须自己读流。
+        // 不能调 readBody()：它只接受 JSON 对象，会直接 400；而且它一旦消费了流，
+        // 再读就拿不到数据了。
+        let password = '';
+        try {
+          const raw = await new Promise((resolve) => {
+            const chunks = [];
+            let total = 0;
+            const MAX = 64 * 1024; // 登录表单不该超过 64KB
+            req.on('data', (c) => {
+              total += c.length;
+              if (total > MAX) { resolve(''); req.destroy(); return; }
+              chunks.push(c);
+            });
+            req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+            req.on('error', () => resolve(''));
+          });
+          // 同时兼容 JSON 体和表单体，方便脚本调用
+          if (raw.trim().startsWith('{')) {
+            try { password = String(JSON.parse(raw)?.password ?? ''); } catch {}
+          } else {
+            password = new URLSearchParams(raw).get('password') ?? '';
+          }
+        } catch {}
+        if (!verifyPassword(password, { salt: passwordSalt, hash: passwordHash })) {
+          loginLimiter.recordFailure(ip);
+          log(`[console] 密码登录失败（${String(ip).slice(0, 40)}）`);
+          res.writeHead(401, { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
+          res.end(loginPageHtml({ action: loginPathFor(pathPrefix), error: '密码不正确' }));
+          return;
+        }
+        loginLimiter.recordSuccess(ip);
+        const issued = sessionStore.issue();
+        const secureCookie = hostHeaderForCookie !== '127.0.0.1' && hostHeaderForCookie !== 'localhost';
+        res.writeHead(302, {
+          ...SECURITY_HEADERS,
+          'Set-Cookie': buildSessionCookie({ name: sessionCookieName, value: issued.cookie, maxAgeMs: sessionTtlMs, secure: secureCookie }),
+          Location: pathPrefix ? `/${pathPrefix}/` : '/'
+        });
+        res.end();
+        return;
+      }
+      if (passwordEnabled && (req.method === 'POST' || req.method === 'GET') && url.pathname === '/logout') {
+        res.writeHead(302, {
+          ...SECURITY_HEADERS,
+          'Set-Cookie': buildClearCookie({ name: sessionCookieName, secure: false }),
+          Location: loginPathFor(pathPrefix)
+        });
+        res.end();
+        return;
+      }
+
       // 控制台鉴权：所有请求需带 x-console-token 或 ?token=
       // 定长比较：`!==` 会在第一个不同的字符处短路，理论上可被本机进程用响应时延逐字节试探。
       // 令牌是 192 bit 随机值且只监听回环，所以这是纵深防御而非在野漏洞。
@@ -4565,6 +4724,9 @@ async function main() {
       // 否则一个只能发 GET 的工具（例如 L1 运维 Agent 的 web_fetch）拿到令牌后就能读管理接口。
       const queryToken = req.method === 'GET' && url.pathname === '/' ? url.searchParams.get('token') : null;
       const suppliedToken = String(queryToken ?? req.headers['x-console-token'] ?? '');
+      // 短密码登录签发的会话 Cookie：有它等价于持有 token（页面刷新后浏览器自动带上）。
+      const sessionCookie = readCookie(req.headers.cookie, sessionCookieName);
+      const sessionValid = Boolean(sessionCookie && sessionStore.verify(sessionCookie));
       const tokenMatches = (() => {
         if (!consoleToken) return false; // 上面已拒绝空令牌；真出现也只许失败关闭，绝不 return true
         const a = Buffer.from(suppliedToken, 'utf8');
@@ -4572,7 +4734,16 @@ async function main() {
         if (a.length !== b.length) return false;
         return crypto.timingSafeEqual(a, b);
       })();
-      if (consoleToken && !tokenMatches) {
+      if (consoleToken && !tokenMatches && !sessionValid) {
+        // 启用了密码登录时：浏览器类请求（GET 页面）直接跳到登录页。
+        // 这样远程访问的人看到的是"输密码"，而不是看不懂的"需要令牌"页。
+        // API 请求仍返回 JSON 401（脚本靠这个判断，不该被 302 到 HTML）。
+        if (passwordEnabled && req.method === 'GET'
+            && (url.pathname === '/' || url.pathname === '/index.html')) {
+          res.writeHead(302, { ...SECURITY_HEADERS, Location: loginPathFor(pathPrefix) });
+          res.end();
+          return;
+        }
         if (req.method === 'GET' && url.pathname === '/') {
           res.writeHead(401, { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
           // 免重复输入：本源 localStorage 里有上次的令牌就先自动试一次（sessionStorage 记一笔，防止旧令牌失效时来回跳）；
@@ -4644,7 +4815,20 @@ async function main() {
         if (origin) {
           let originHost = '';
           try { originHost = new URL(String(origin)).host; } catch {}
-          if (![`127.0.0.1:${boundPort}`, `localhost:${boundPort}`, `[::1]:${boundPort}`].includes(originHost)) {
+          // 用实际监听端口：consolePort 可能为 0（测试夹具），那时配置值不是请求里的端口。
+          const boundPortNow = server.address()?.port ?? port;
+          const okHosts = ['127.0.0.1:' + boundPortNow, 'localhost:' + boundPortNow, '[::1]:' + boundPortNow];
+          // 远程访问（cloudflared / 反代）：浏览器从 https://<你的域名>/admin/ 发写请求时，
+          // Origin 是 https://<你的域名> —— 端口是 443（或省略），跟本机 3100 对不上。
+          // 所以要把 console.allowRemoteHosts 里配置的域名也纳入白名单，否则所有写操作都会被当跨站拒绝。
+          // 注意：这只放行「已配置的域名」，任意其它来源仍被拒 —— CSRF 防护本身没有被削弱。
+          const remoteAllow = Array.isArray(cfg.console?.allowRemoteHosts) ? cfg.console.allowRemoteHosts : [];
+          const originHostname = originHost.replace(/:\d+$/, '');
+          const remoteOk = remoteAllow.some((h) => {
+            const want = String(h ?? '').toLowerCase().trim();
+            return want && (want === originHost.toLowerCase() || want === originHostname.toLowerCase());
+          });
+          if (!okHosts.includes(originHost) && !remoteOk) {
             sendJson({ ok: false, error: '跨站请求被拒绝' }, 403);
             return;
           }
@@ -4724,7 +4908,11 @@ async function main() {
         if (req.method === 'GET' && url.pathname === '/') {
           res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
           try {
-            res.end(fs.readFileSync(path.join(ROOT, 'public', 'console.html'), 'utf8'));
+            const pageHtml = fs.readFileSync(path.join(ROOT, 'public', 'console.html'), 'utf8');
+            // 告诉前端`本次是密码登录模式`，它据此决定 401 时跳登录页还是弹令牌框。
+            // 这只是行为分支标记，不含凭据（真正的鉴权是 HttpOnly Cookie）。
+            const flag = '<script>window.__QB_PASSWORD_LOGIN__ = ' + (passwordEnabled ? 'true' : 'false') + ';</script>';
+            res.end(pageHtml.includes('<head>') ? pageHtml.replace('<head>', '<head>' + flag) : flag + pageHtml);
           } catch {
             res.end('控制台页面缺失：qq-bridge/public/console.html');
           }
@@ -7076,6 +7264,392 @@ async function main() {
           }
           return;
         }
+        // ── B 站视频解析（接入层；解析与排版都在 bili-*.js，这里不写业务逻辑）──────
+        // 对话里出现 BV/av 号或 b23.tv 短链时，回一张封面 + 三行信息。
+        // 限流按会话存 lastAt，默认 20 秒内不再请求，可用 socialV2.bili.cooldownMs 调。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/bili') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const text = String(body.text ?? '').trim();
+          const cooldownMs = Number(cfg.socialV2?.bili?.cooldownMs) || 20000;
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          if (!text) { sendJson({ ok: false, error: 'text 不能为空' }, 400); return; }
+          if (!v2ToolEnabled('bili')) { sendJson({ ok: false, error: '工具未启用：qq_bili' }, 403); return; }
+          const st = getSocialV2State(key);
+          const nowBili = Date.now();
+          try {
+            const hit = await parseBiliLink(text);
+            if (!hit) { sendJson({ ok: true, key, parsed: false }); return; }
+            // 冷却判定按「同一个视频」算，不按「任何视频」：
+            // 时间窗内解析另一条视频是正常需求，不该被拒。
+            const lastAt = Number(st.biliLastAt) || 0;
+            const sameVideo = st.biliLastId && st.biliLastId === hit.id;
+            if (sameVideo && lastAt && nowBili - lastAt < cooldownMs) {
+              sendJson({ ok: false, error: `刚解析过这条：本会话 ${Math.ceil((cooldownMs - (nowBili - lastAt)) / 1000)} 秒后可再试` }, 429);
+              return;
+            }
+            const meta = await fetchBiliMeta(hit.id);
+            if (!meta?.title) { sendJson({ ok: false, error: '视频信息解析失败' }, 502); return; }
+            st.biliLastAt = nowBili;
+            st.biliLastId = meta.id;
+            saveSocialV2State();
+            const cardText = renderBiliText(meta);
+            const coverUrl = biliCoverUrl(meta);
+            log(`[bili] ${key} 解析 ${meta.id}: ${String(meta.title).slice(0, 40)}`);
+            // 照参考实现：**封面图 + 文字在同一条消息里**（image 段在前，text 段在后）。
+            // 封面下载失败就只发文字，不要让整条解析因为一张图而失败。
+            const keyMatch = /^(group|private):(\d+)$/.exec(key);
+            if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+            const kind = keyMatch[1];
+            const id = Number(keyMatch[2]);
+            const segments = [];
+            let coverSent = false;
+            if (coverUrl) {
+              try {
+                const fetched = await safeFetchBuffer(coverUrl, 8 * 1024 * 1024);
+                const buf = fetched.buffer ?? fetched;
+                if (looksLikeImageBuffer(buf)) {
+                  segments.push({ type: 'image', data: { file: 'base64://' + buf.toString('base64') } });
+                  coverSent = true;
+                }
+              } catch (e) {
+                log(`[bili] 封面下载失败，只发文字 ${key}:`, e?.message ?? e);
+              }
+            }
+            segments.push({ type: 'text', data: { text: cardText } });
+            const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
+            const params = kind === 'private' ? { user_id: id, message: segments } : { group_id: id, message: segments };
+            const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+            const res = await fetch(`${httpUrl}/${action}`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {}) },
+              body: JSON.stringify(params),
+              signal: AbortSignal.timeout(30000)
+            });
+            const rb = await res.json().catch(() => ({}));
+            if (!res.ok || rb.status !== 'ok' || rb.retcode !== 0) {
+              throw new Error(`OneBot ${action} 失败: ${rb.wording || rb.retcode || res.status}`);
+            }
+            sendJson({ ok: true, key, parsed: true, meta, text: cardText, coverSent, messageId: rb.data?.message_id ?? null });
+          } catch (error) {
+            log(`[bili] 解析失败 ${key}:`, error?.message ?? error);
+            sendJson({ ok: false, error: `解析失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
+
+        // ── 摸头 GIF（petpet）────────────────────────────────────────────
+        // 接口：GET /api/v1/image/motou?qq=<QQ号>（第三方 uapis，返回 GIF89a）
+        // 两种触发：
+        //   1) AI 主动调用：POST /api/socialV2/motou {key, uin, send?}
+        //   2) 群里固定指令：由 handleIncoming 里的 tryHandleMotouCommand 自动识别并调用本端点
+        // 限流按会话存 lastAt，默认 10 秒（摸头图比较轻，比 B 站更宽松）。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/motou') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const rawUin = body.uin ?? body.userId ?? body.user_id ?? body.qq;
+          const cooldownMs = Number(cfg.socialV2?.motou?.cooldownMs) || 10000;
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          if (!v2ToolEnabled('motou')) { sendJson({ ok: false, error: '工具未启用：qq_motou' }, 403); return; }
+          const uin = normalizeQQ(rawUin);
+          if (!uin) { sendJson({ ok: false, error: 'QQ 号不合法（需 5~12 位数字）' }, 400); return; }
+          if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: '必须携带 agent token' }, 403); return; }
+          if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          const kind = keyMatch[1];
+          const id = Number(keyMatch[2]);
+          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
+            sendJson({ ok: false, error: '当前模式不允许操作该会话' }, 403);
+            return;
+          }
+          const st = getSocialV2State(key);
+          const nowMotou = Date.now();
+          const lastAt = Number(st.motouLastAt) || 0;
+          if (lastAt && nowMotou - lastAt < cooldownMs) {
+            sendJson({ ok: false, error: `刚做过摸头：本会话 ${Math.ceil((cooldownMs - (nowMotou - lastAt)) / 1000)} 秒后可再试` }, 429);
+            return;
+          }
+          try {
+            const gif = await fetchMotouGif(uin);
+            if (!gif) { sendJson({ ok: false, error: '摸头图生成失败（接口没返回 GIF）' }, 502); return; }
+            st.motouLastAt = nowMotou;
+            saveSocialV2State();
+            const seg = motouImageSegment(gif);
+            const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
+            const params = kind === 'private' ? { user_id: id, message: [seg] } : { group_id: id, message: [seg] };
+            const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+            const res = await fetch(`${httpUrl}/${action}`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {}) },
+              body: JSON.stringify(params),
+              signal: AbortSignal.timeout(30000)
+            });
+            const rb = await res.json().catch(() => ({}));
+            if (!res.ok || rb.status !== 'ok' || rb.retcode !== 0) {
+              throw new Error(`OneBot ${action} 失败: ${rb.wording || rb.retcode || res.status}`);
+            }
+            log(`[motou] ${key} 摸头 ${uin} (${Math.round(gif.length / 1024)} KB)`);
+            sendJson({ ok: true, key, uin, bytes: gif.length, messageId: rb.data?.message_id ?? null });
+          } catch (error) {
+            log(`[motou] 失败 ${key} uin=${uin}:`, error?.message ?? error);
+            sendJson({ ok: false, error: `摸头失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
+        // ── QQ 头像（看图 / 发图 / 改自己的头像） ──────────────────────────
+        // 头像走 q.qlogo.cn 公开接口：https://q.qlogo.cn/headimg_dl?dst_uin=<QQ号>&spec=<尺寸>&img_type=jpg
+        // 实测 spec: 0=原图 1=40px 3=100px 4=140px 5/640=640px；无效号会返回一张非图片的默认图。
+        // ⚠️ 返回格式取决于账号当前头像的上传格式（PNG 头像就返回 image/png），
+        //    所以不能用「是不是 JPEG」来判断有没有头像，必须按文件头识别真实格式。
+        // 安全：只接受数字 QQ 号（不接受 URL），所以不需要额外 SSRF 校验；下载仍走 safeFetchBuffer。
+        const detectAvatarImage = (buf) => {
+          if (!Buffer.isBuffer(buf) || buf.length < 64) return null;
+          // 无效账号/无头像时 q.qlogo.cn 会返回一张很小的默认占位图（实测约 971 字节，
+          // 而且它**也是合法的 PNG**）。所以除了看文件头，还要有尺寸下限，
+          // 否则会把"默认头像"当成真头像返回给模型。
+          if (buf.length < 2000) return null;
+          if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
+          if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+          if (buf.toString('ascii', 0, 6) === 'GIF87a' || buf.toString('ascii', 0, 6) === 'GIF89a') return 'image/gif';
+          if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 && buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50) return 'image/webp';
+          return null;
+        };
+        if ((req.method === 'POST' || req.method === 'GET') && url.pathname === '/api/socialV2/avatar') {
+          const body = req.method === 'POST' ? await readBody() : {};
+          const q = url.searchParams;
+          const key = String((req.method === 'POST' ? body.key : q.get('key')) ?? '').trim();
+          const rawUin = String((req.method === 'POST' ? (body.uin ?? body.userId ?? body.user_id) : (q.get('uin') || q.get('userId'))) ?? '').trim();
+          const specRaw = Number((req.method === 'POST' ? body.spec : q.get('spec')) ?? 0);
+          const uinList = Array.isArray(body.uins) ? body.uins : null;
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) {
+            sendJson({ ok: false, error: 'agent token 无效' }, 403);
+            return;
+          }
+          // 只允许数字 QQ 号；顺带接受数组形式（批量看群成员头像）。
+          const candidates = uinList ?? [rawUin];
+          const uins = [];
+          for (const c of candidates) {
+            const s = String(c ?? '').trim();
+            if (!/^[1-9]\d{4,11}$/.test(s)) {
+              sendJson({ ok: false, error: `QQ 号不合法：${s.slice(0, 20)}（只接受 5~12 位数字）` }, 400);
+              return;
+            }
+            uins.push(s);
+          }
+          if (uins.length > 20) { sendJson({ ok: false, error: '一次最多取 20 个头像' }, 400); return; }
+          const SPECS = new Set([0, 1, 3, 4, 5, 640]);
+          const spec = SPECS.has(specRaw) ? specRaw : 0;
+          try {
+            const out = [];
+            for (const uin of uins) {
+              try {
+                const url = `https://q.qlogo.cn/headimg_dl?dst_uin=${uin}&spec=${spec}&img_type=jpg`;
+                const fetched = await safeFetchBuffer(url, 4 * 1024 * 1024);
+                const buf = fetched.buffer ?? fetched;
+                const mimeType = detectAvatarImage(buf);
+                if (!mimeType) { out.push({ uin, ok: false, error: '没有头像或账号不存在' }); continue; }
+                out.push({ uin, ok: true, mimeType, byteLength: buf.length, data: buf.toString('base64') });
+              } catch (error) {
+                out.push({ uin, ok: false, error: String(error?.message ?? error).slice(0, 200) });
+              }
+            }
+            sendJson({ ok: true, key, spec, avatars: out });
+          } catch (error) {
+            sendJson({ ok: false, error: `获取头像失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
+        // 把某个人的头像作为图片**发到聊天**（群聊/私聊）。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/send-avatar') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const uin = String(body.uin ?? body.userId ?? '').trim();
+          const specRaw = Number(body.spec ?? 0);
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          if (!/^[1-9]\d{4,11}$/.test(uin)) { sendJson({ ok: false, error: 'uin 必须是 5~12 位数字 QQ 号' }, 400); return; }
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: '必须携带 agent token' }, 403); return; }
+          if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          const kind = keyMatch[1];
+          const id = Number(keyMatch[2]);
+          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
+            sendJson({ ok: false, error: '当前模式不允许操作该会话' }, 403);
+            return;
+          }
+          const SPECS = new Set([0, 1, 3, 4, 5, 640]);
+          const spec = SPECS.has(specRaw) ? specRaw : 5;   // 发图默认 640px，够清晰又不至于太大
+          try {
+            const url = `https://q.qlogo.cn/headimg_dl?dst_uin=${uin}&spec=${spec}&img_type=jpg`;
+            const fetched = await safeFetchBuffer(url, 4 * 1024 * 1024);
+            const buf = fetched.buffer ?? fetched;
+            const mimeType = detectAvatarImage(buf);
+            if (!mimeType) { sendJson({ ok: false, error: '这个人没有头像或账号不存在' }, 404); return; }
+            const segments = [{ type: 'image', data: { file: 'base64://' + buf.toString('base64') } }];
+            const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
+            const params = kind === 'private' ? { user_id: id, message: segments } : { group_id: id, message: segments };
+            const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+            const res = await fetch(`${httpUrl}/${action}`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {}) },
+              body: JSON.stringify(params),
+              signal: AbortSignal.timeout(30000)
+            });
+            const rb = await res.json().catch(() => ({}));
+            if (!res.ok || rb.status !== 'ok' || rb.retcode !== 0) {
+              throw new Error(`OneBot ${action} 失败: ${rb.wording || rb.retcode || res.status}`);
+            }
+            log(`[reserved2] 工具发头像 ${key} uin=${uin} spec=${spec} bytes=${buf.length}`);
+            sendJson({ ok: true, key, uin, spec, messageId: rb.data?.message_id ?? null });
+          } catch (error) {
+            log(`[reserved2] 工具发头像失败 ${key} uin=${uin}:`, error?.message ?? error);
+            sendJson({ ok: false, error: `发头像失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
+        // 改机器人自己的头像（需要本地图片，且不可逆）。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/set-avatar') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const file = String(body.file ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          if (!file) { sendJson({ ok: false, error: 'file 不能为空（必须是 avatar/ 目录下的图片文件名）' }, 400); return; }
+          if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: '必须携带 agent token' }, 403); return; }
+          if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2ToolEnabled('setAvatar')) { sendJson({ ok: false, error: '工具未启用：qq_set_avatar' }, 403); return; }
+          // 只允许 avatar/ 目录下的图片，禁止路径穿越与任意本地文件
+          const dir = path.resolve(ROOT, 'avatar');
+          const safe = path.resolve(dir, path.basename(file));
+          if (!safe.startsWith(dir + path.sep)) { sendJson({ ok: false, error: '文件名不合法' }, 400); return; }
+          if (!fs.existsSync(safe)) { sendJson({ ok: false, error: `avatar/ 下找不到 ${path.basename(file)}` }, 404); return; }
+          const ext = path.extname(safe).toLowerCase();
+          if (!['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext)) {
+            sendJson({ ok: false, error: '只支持 jpg / png / gif / webp' }, 400);
+            return;
+          }
+          const buf = fs.readFileSync(safe);
+          if (buf.length > 4 * 1024 * 1024) { sendJson({ ok: false, error: '图片超过 4 MB' }, 400); return; }
+          // 防刷屏：按**自然日次数**限额，而不是间隔。
+          // 真人换头像是有节点的（心情变了、节日、换季），一天换几次很正常，
+          // 但一天换十几次就是在刷自己的门面了。默认每天 3 次，可用
+          // socialV2.avatar.maxPerDay 调整；跨天自动重置（按本地时区日期）。
+          const maxPerDay = Number(cfg.socialV2?.avatar?.maxPerDay);
+          const dailyCap = Number.isFinite(maxPerDay) && maxPerDay >= 0 ? maxPerDay : 3;
+          const todayStr = (() => {
+            const d = new Date();
+            const p = (n) => String(n).padStart(2, '0');
+            return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+          })();
+          try {
+            if (dailyCap > 0) {
+              const st = getSocialV2State(key);
+              // 跨天则清零；旧数据没有 day 字段也视为新的一天
+              if (st.avatarDay !== todayStr) {
+                st.avatarDay = todayStr;
+                st.avatarCountToday = 0;
+              }
+              const used = Number(st.avatarCountToday) || 0;
+              if (used >= dailyCap) {
+                const lastFile = st.lastAvatarFile ? `（现在是 ${st.lastAvatarFile}）` : '';
+                sendJson({
+                  ok: false,
+                  error: `今天已经换过 ${used} 次头像了${lastFile}，每天最多 ${dailyCap} 次，明天再说吧。`
+                }, 429);
+                return;
+              }
+            }
+          } catch {}
+          try {
+            // NapCat 的 set_qq_avatar 接受 base64:// 或本地路径
+            await bot.raw('set_qq_avatar', { file: 'base64://' + buf.toString('base64') });
+            try {
+              const st2 = getSocialV2State(key);
+              st2.lastAvatarChangeAt = Date.now();
+              st2.lastAvatarFile = path.basename(safe);
+              if (st2.avatarDay !== todayStr) { st2.avatarDay = todayStr; st2.avatarCountToday = 0; }
+              st2.avatarCountToday = (Number(st2.avatarCountToday) || 0) + 1;
+              saveSocialV2State();
+            } catch {}
+            log(`[reserved2] 工具改头像: ${path.basename(safe)} (${buf.length} bytes)`);
+            sendJson({ ok: true, key, file: path.basename(safe), bytes: buf.length });
+          } catch (error) {
+            log('[reserved2] 工具改头像失败:', error?.message ?? error);
+            sendJson({ ok: false, error: `改头像失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
+        // 把自己在聊天里看到的一张图**收藏成头像素材**（写进 avatar/）。
+        // 为什么需要它：avatar/ 默认只能由管理员手动放图，但 AI 在群里看到喜欢的图
+        // 却用不上 —— 那让它"自主换头像"就变成了只能在固定几张里挑，没什么意义。
+        // 安全边界：只接受**当前会话最近消息里出现过**的 media（按 messageId 定位，
+        // 不能传任意 URL/路径），所以不存在 SSRF 或读本地任意文件。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/save-avatar') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const messageId = String(body.messageId ?? '').trim();
+          const imageIndex = Number(body.imageIndex ?? 0);
+          const name = String(body.name ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          if (!messageId) { sendJson({ ok: false, error: 'messageId 不能为空' }, 400); return; }
+          if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: '必须携带 agent token' }, 403); return; }
+          if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (!v2ToolEnabled('setAvatar')) { sendJson({ ok: false, error: '工具未启用：qq_set_avatar' }, 403); return; }
+          try {
+            // 只从**本会话最近消息**里找这条消息的 media，杜绝任意来源
+            const st = getSocialV2State(key);
+            const msg = (st.recentMessages || []).find((m) => m && String(m.messageId) === messageId);
+            if (!msg) {
+              sendJson({ ok: false, error: '这条消息不在本会话最近的上下文里（只能收藏你最近看到的消息）' }, 404);
+              return;
+            }
+            const mediaList = Array.isArray(msg.media) ? msg.media : [];
+            if (!mediaList.length) { sendJson({ ok: false, error: '这条消息里没有图片' }, 400); return; }
+            const target = mediaList[imageIndex];
+            if (!target) { sendJson({ ok: false, error: `这条消息里没有第 ${imageIndex + 1} 张图（共 ${mediaList.length} 张）` }, 400); return; }
+            const fetched = await fetchMediaData([target]);
+            const img = Array.isArray(fetched) ? fetched.find((x) => x && x.data) : null;
+            if (!img?.data) {
+              const why = Array.isArray(fetched) && fetched[0]?.text ? fetched[0].text : '取不到图片字节';
+              sendJson({ ok: false, error: `取不到这张图：${why}` }, 400);
+              return;
+            }
+            const buf = Buffer.from(img.data, 'base64');
+            if (!looksLikeImageBuffer(buf)) { sendJson({ ok: false, error: '拿到的不是有效图片' }, 400); return; }
+            if (buf.length > 4 * 1024 * 1024) { sendJson({ ok: false, error: '图片超过 4 MB，不适合做头像' }, 400); return; }
+            // 按实际格式起名，避免改扩展名后 NapCat 认不出
+            const ext = buf[0] === 0x89 ? '.png'
+              : buf.toString('ascii', 0, 3) === 'GIF' ? '.gif'
+              : (buf[0] === 0x52 && buf[8] === 0x57) ? '.webp'
+              : '.jpg';
+            const safeBase = path.basename(String(name || '').trim() || `from-chat-${Date.now()}`)
+              .replace(/[^\w\u4e00-\u9fa5.-]/g, '')
+              .slice(0, 40) || `from-chat-${Date.now()}`;
+            const dir = path.resolve(ROOT, 'avatar');
+            fs.mkdirSync(dir, { recursive: true });
+            let fileName = safeBase.replace(/\.(jpe?g|png|gif|webp)$/i, '') + ext;
+            let full = path.resolve(dir, fileName);
+            let n = 1;
+            while (fs.existsSync(full)) {
+              if (n > 50) throw new Error('avatar/ 里同名文件太多');
+              fileName = safeBase.replace(/\.(jpe?g|png|gif|webp)$/i, '') + `-${n}` + ext;
+              full = path.resolve(dir, fileName);
+              n += 1;
+            }
+            if (!full.startsWith(dir + path.sep)) throw new Error('文件名不合法');
+            fs.writeFileSync(full, buf);
+            log(`[reserved2] 收藏聊天图片为头像素材: ${fileName} (${buf.length} bytes)`);
+            sendJson({ ok: true, key, file: fileName, bytes: buf.length });
+          } catch (error) {
+            log(`收藏头像素材失败 ${key}:`, error?.message ?? error);
+            sendJson({ ok: false, error: `收藏失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
         // ── 撤回自己发的消息（reserved2） ────────────────────────────────
         // 只允许撤回**自己发的**消息：AI 说错话、发重复了、发错了地方，用它收回。
         // 不提供撤回别人的消息（那是管理员权限，不该给 AI）。
@@ -9300,6 +9874,28 @@ async function main() {
 
   // QQ 发送队列（顺序发送 + 间隔，避免触发频率限制）
   let sendChain = Promise.resolve();
+  // ── 会话令牌「片段」检测（安全修复，来自上游 4ed0142）─────────────────────
+  //
+  // 背景：整串匹配（`text.includes(token)`）只拦得住「一次性把整个 token 发出去」。
+  // 模型只要把同一个 token 拆成多条消息，整串匹配就全部落空 —— 而拆条恰好是这个桥接
+  // **鼓励**的行为（想分多条消息时用空格分隔）。QQ 上拼起来就是完整令牌。
+  //
+  // 做法：拿每个已知 token 的**所有 12 字符窗口**去比对。12 是权衡值 —— 足够长到不会
+  // 在日常聊天里误伤（随机 12 字符 hex 段碰撞概率可忽略），又足够短到拆条后每段仍能命中。
+  const TOKEN_FRAGMENT_WIDTH = 12;
+
+  /** 文本里是否出现任一已知 token 的任意 12 字符窗口。 */
+  function hasKnownTokenFragment(text) {
+    const value = String(text ?? '');
+    if (!value) return false;
+    for (const token of KNOWN_AGENT_TOKENS) {
+      if (!token || token.length < TOKEN_FRAGMENT_WIDTH) continue;
+      for (let i = 0; i + TOKEN_FRAGMENT_WIDTH <= token.length; i += 1) {
+        if (value.includes(token.slice(i, i + TOKEN_FRAGMENT_WIDTH))) return true;
+      }
+    }
+    return false;
+  }
   function redactKnownTokensOnly(text) {
     let s = String(text ?? '');
     for (const token of KNOWN_AGENT_TOKENS) {
@@ -10056,6 +10652,14 @@ async function main() {
   }
 
   function sendMessagesV2(key, messages, delays, replyToMessageId, atUserId = null) {
+    // 先审计整批（安全修复，来自上游 4ed0142）：
+    // 令牌可被拆成多段，每段都短于逐条闸门的窗口。必须在发送第一段前拒绝整批，
+    // 否则第一段已经离开进程，后面即使拦住也来不及。
+    // onebotSend 仍会在实际发送时逐条复核，这里是额外的「整批」防线。
+    if (hasKnownTokenFragment(messages.join(''))) {
+      log(`发送内容包含会话令牌，已阻止整批发送 (${key})`);
+      return Promise.reject(new Error('发送内容包含会话令牌，已阻止发送'));
+    }
     const assertSendAllowed = captureSendGuard(key);
     const [kind, id] = key.split(':');
     const sent = [];
@@ -13305,6 +13909,111 @@ async function main() {
 
     // 补收的消息到这里为止只做记录类的事：命令、审批、挂起提问的回答、角色切换一律不处理
     if (backfill && (plainContent.startsWith('/') || /进入角色扮演|退出角色扮演|切换角色|设置角色|改角色|换角色|关闭角色扮演|开启角色扮演/.test(plainContent))) return;
+
+    // ── 摸头 GIF 固定指令（不走模型，直接在桥接里处理）──────────────────
+    // 触发：「摸头 @某人」/「摸摸头 @某人」/「petpet @某人」/「rua @某人」
+    // 也接受正文里带的 QQ 号：摸头 1234567890
+    // 补收的消息不处理（和上面命令一致），避免断线后补一堆表情。
+    if (!backfill && v2ToolEnabled('motou')) {
+      const motouHit = parseMotouCommand(event, plainContent);
+      if (motouHit) {
+        const mUin = normalizeQQ(motouHit);
+        if (mUin) {
+          const mSt = getSocialV2State(key);
+          const mNow = Date.now();
+          const mCooldown = Number(cfg.socialV2?.motou?.cooldownMs) || 10000;
+          const mLast = Number(mSt.motouLastAt) || 0;
+          if (!mLast || mNow - mLast >= mCooldown) {
+            try {
+              const gif = await fetchMotouGif(mUin);
+              if (gif) {
+                const seg = motouImageSegment(gif);
+                const mAct = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
+                const mParams = kind === 'private'
+                  ? { user_id: Number(id), message: [seg] }
+                  : { group_id: Number(id), message: [seg] };
+                const mHttp = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+                await fetch(`${mHttp}/${mAct}`, {
+                  method: 'POST',
+                  headers: { 'content-type': 'application/json', ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {}) },
+                  body: JSON.stringify(mParams),
+                  signal: AbortSignal.timeout(30000)
+                });
+                mSt.motouLastAt = mNow;
+                saveSocialV2State();
+                log(`[motou] 指令触发 ${key} 摸头 ${mUin} (${Math.round(gif.length / 1024)} KB)`);
+                appendActivity(`${key} 摸头 ${mUin}`);
+                return;
+              }
+              log(`[motou] 指令触发但生成失败 ${key} uin=${mUin}`);
+            } catch (mErr) {
+              log(`[motou] 指令触发异常 ${key}:`, mErr?.message ?? mErr);
+            }
+          }
+        }
+      }
+    }
+
+    // ── B 站链接自动解析（群里发 BV 号 / 短链就回卡片，不走模型）────────────
+    // 和上面「摸头」一样是**固定触发**：识别到就直接发，不再交给 AI 判断。
+    // 为什么必须这样：qq_bili 只是个工具，AI 完全可以"没意识到该调"就不吭声 ——
+    // 实测群里发链接经常毫无反应，就是这个原因。
+    if (!backfill && v2ToolEnabled('bili')) {
+      let biliHit = null;
+      try { biliHit = await parseBiliLink(plainContent); } catch {}
+      if (biliHit) {
+        const bSt = getSocialV2State(key);
+        const bNow = Date.now();
+        const bCooldown = Number(cfg.socialV2?.bili?.cooldownMs) || 20000;
+        const bLast = Number(bSt.biliLastAt) || 0;
+        // 冷却判定：同一视频在冷却期内重复出现才跳过；不同视频照常解析。
+        // 旧实现是「冷却期内一律跳过」，群里连发两条不同视频时第二条会静默消失。
+        const sameVideo = bSt.biliLastId && bSt.biliLastId === biliHit.id;
+        const inCooldown = bLast && bNow - bLast < bCooldown;
+        if (!inCooldown || !sameVideo) {
+          try {
+            const meta = await fetchBiliMeta(biliHit.id);
+            if (meta && meta.title) {
+              const cardText = renderBiliText(meta);
+              const coverUrl = biliCoverUrl(meta);
+              const segs = [];
+              if (coverUrl) {
+                try {
+                  const fetched = await safeFetchBuffer(coverUrl, 8 * 1024 * 1024);
+                  const buf = fetched?.buffer ?? fetched;
+                  if (looksLikeImageBuffer(buf)) {
+                    segs.push({ type: 'image', data: { file: 'base64://' + buf.toString('base64') } });
+                  }
+                } catch (e) {
+                  log(`[bili] 自动触发：封面下载失败 ${key}:`, e?.message ?? e);
+                }
+              }
+              segs.push({ type: 'text', data: { text: cardText } });
+              const bAct = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
+              const bParams = kind === 'private'
+                ? { user_id: Number(id), message: segs }
+                : { group_id: Number(id), message: segs };
+              const bHttp = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+              await fetch(`${bHttp}/${bAct}`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {}) },
+                body: JSON.stringify(bParams),
+                signal: AbortSignal.timeout(30000)
+              });
+              bSt.biliLastAt = bNow;
+              bSt.biliLastId = meta.id;
+              saveSocialV2State();
+              log(`[bili] 自动触发 ${key} 解析 ${meta.id}: ${String(meta.title).slice(0, 40)}`);
+              appendActivity(`${key} B站解析 ${meta.id}`);
+              return;
+            }
+            log(`[bili] 自动触发但元信息解析失败 ${key} id=${biliHit.id}`);
+          } catch (bErr) {
+            log(`[bili] 自动触发异常 ${key}:`, bErr?.message ?? bErr);
+          }
+        }
+      }
+    }
 
     // v0.3.0 审批：带编号的回复（多个挂起时必须带编号）。
     if (!backfill && await tryHandleApprovalReply(key, plainContent, isOwner)) return;

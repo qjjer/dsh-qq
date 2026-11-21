@@ -335,6 +335,14 @@ const TOOL_CONFIG_FLAGS = {
   // token 才改注册期过滤的），又诱导模型误调。`qq_set_sticker_remark` 默认就是 `false`
   // （见 bridge.js 的 socialV2.tools 默认表），所以此前它一直是"默认关闭却仍然可见"。
   qq_send_poke: 'sendPoke',
+  qq_get_avatar: 'seeAvatar',
+  qq_get_avatars: 'seeAvatar',
+  qq_send_avatar: 'sendAvatar',
+  qq_set_avatar: 'setAvatar',
+  qq_list_avatar_files: 'setAvatar',
+  qq_save_avatar_from_chat: 'setAvatar',
+  qq_bili: 'bili',
+  qq_motou: 'motou',
   qq_recall: 'recall',
   qq_get_message_images: 'getImages',
   qq_get_forward_msg: 'getForwardMsg',
@@ -1906,6 +1914,283 @@ if (cfg.socialV2?.tools?.speak === true) {
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
       } catch (error) {
         return { content: [{ type: 'text', text: `发语音失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// QQ 头像：看 / 批量看 / 发到聊天 / 改自己的
+// 头像走 q.qlogo.cn 公开接口，只需 QQ 号，不需要鉴权。
+// ════════════════════════════════════════════════════════════════════════
+const AVATAR_SPEC_HINT = '尺寸 spec：0 原图 / 1 40px / 3 100px / 4 140px / 5 或 640 = 640px';
+
+if (cfg.socialV2?.tools?.seeAvatar !== false) {
+  server.tool(
+    'qq_get_avatar',
+    '看某个人（或自己）的 QQ 头像，图片会直接进入你的视觉上下文——这样你才是“真的看见过”对方的头像，而不是假装。'
+      + '聊到「你头像好可爱」「换头像了？」这类话题、或需要认出谁是谁时用。只读，不会发任何东西出去。'
+      + '群聊和私聊都能用。一次只看一个人；要同时看好几个用 qq_get_avatars。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌'),
+      uin: z.union([z.number(), z.string()]).describe('要看谁的 QQ 号（可从消息的 userId 或 qq_get_active_members 拿；看自己用机器人号）'),
+      spec: z.number().int().optional().describe(AVATAR_SPEC_HINT + '（默认 5，看得清又不浪费 token）'),
+    },
+    async ({ key, token, uin, spec }) => {
+      try {
+        const data = await agentApi('/api/socialV2/avatar', {
+          method: 'POST',
+          body: JSON.stringify({ key, uin: String(uin), spec: spec ?? 5 }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 60000
+        });
+        const av = Array.isArray(data?.avatars) ? data.avatars[0] : null;
+        if (!av?.ok || !av.data) {
+          return { content: [{ type: 'text', text: `没拿到 ${uin} 的头像：${av?.error ?? '未知原因'}（可能没设置头像或账号不存在）` }], isError: true };
+        }
+        return {
+          content: [
+            { type: 'text', text: `${uin} 的头像（${Math.round((av.byteLength || 0) / 1024)} KB）：` },
+            { type: 'image', mimeType: av.mimeType || 'image/jpeg', data: av.data }
+          ]
+        };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `看头像失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_get_avatars',
+    '同时看多个人的 QQ 头像（最多 20 个），全部进入你的视觉上下文。用于「这几个人分别是谁」或刚进一个群想认人时。'
+      + '只读。注意：一次看太多会占很多上下文，只在确实需要时用，一般 3~8 个就够。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌'),
+      uins: z.array(z.union([z.number(), z.string()])).describe('QQ 号数组（最多 20 个）'),
+      spec: z.number().int().optional().describe(AVATAR_SPEC_HINT + '（批量看建议用 3 = 100px，省上下文）'),
+    },
+    async ({ key, token, uins, spec }) => {
+      try {
+        const list = (uins ?? []).map(String).slice(0, 20);
+        if (!list.length) return { content: [{ type: 'text', text: 'uins 不能为空' }], isError: true };
+        const data = await agentApi('/api/socialV2/avatar', {
+          method: 'POST',
+          body: JSON.stringify({ key, uins: list, spec: spec ?? 3 }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 120000
+        });
+        const content = [];
+        const notes = [];
+        for (const av of (data?.avatars ?? [])) {
+          if (av?.ok && av.data) {
+            notes.push(`${av.uin} ✓`);
+            content.push({ type: 'image', mimeType: av.mimeType || 'image/jpeg', data: av.data });
+          } else {
+            notes.push(`${av.uin} ✗（${av?.error ?? '无头像'}）`);
+          }
+        }
+        content.unshift({ type: 'text', text: `头像一览：${notes.join('  ')}` });
+        return { content };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `批量看头像失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.sendAvatar !== false) {
+  server.tool(
+    'qq_send_avatar',
+    '把某个人的 QQ 头像当成一张图片**发到当前聊天**（群聊/私聊都行）。'
+      + '用在「你看这是谁」「这人头像好好笑」这类场合，或者对方问你「我头像好看吗」时直接发出来。'
+      + '注意：发出去就是一张真实的图，撤不回来（要撤只能撤整条消息，见 qq_recall）；别刷屏，一次一条就够。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌'),
+      uin: z.union([z.number(), z.string()]).describe('要发谁的头像（QQ 号）'),
+      spec: z.number().int().optional().describe(AVATAR_SPEC_HINT + '（默认 5 = 640px）'),
+    },
+    async ({ key, token, uin, spec }) => {
+      try {
+        const data = await agentApi('/api/socialV2/send-avatar', {
+          method: 'POST',
+          body: JSON.stringify({ key, uin: String(uin), spec: spec ?? 5 }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 90000
+        });
+        return { content: [{ type: 'text', text: `已发出 ${uin} 的头像${data?.messageId ? `（messageId=${data.messageId}）` : ''}` }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `发头像失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.setAvatar === true) {
+  server.tool(
+    'qq_list_avatar_files',
+    '列出 avatar/ 目录里所有可用的头像图片（文件名 + 大小）。换头像前先看这里有什么可选，别猜文件名。'
+      + '只在管理员本人私聊里可用。',
+    {
+      key: z.string().describe('会话 key（必须是管理员私聊 private:<ownerQQ>）'),
+      token: z.string().describe('会话令牌'),
+    },
+    async ({ key, token }) => {
+      try {
+        const auth = isOwnerPrivate(key);
+        if (!auth.ok) return { content: [{ type: 'text', text: auth.error }], isError: true };
+        const dir = path.join(ROOT, 'avatar');
+        let files = [];
+        try { files = fs.readdirSync(dir); } catch { files = []; }
+        const list = files
+          .filter((f) => /\.(jpe?g|png|gif|webp)$/i.test(f))
+          .map((f) => {
+            let size = 0;
+            try { size = fs.statSync(path.join(dir, f)).size; } catch {}
+            return { file: f, kb: Math.round(size / 1024) };
+          });
+        if (!list.length) {
+          return { content: [{ type: 'text', text: 'avatar/ 目录里现在没有可用图片，换不了头像。' + '（需要管理员先往 avatar/ 放几张图）' }] };
+        }
+        return {
+          content: [{
+            type: 'text',
+            text: `avatar/ 里可选 ${list.length} 张：\n` + list.map((x) => `  ${x.file}（${x.kb} KB）`).join('\n')
+          }]
+        };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `列头像文件失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_save_avatar_from_chat',
+    '把聊天里看到的某张图**收藏成头像素材**（存进 avatar/，之后就能用它换头像）。'
+      + '用在「这张图好好看，我想拿来当头像」的时候——你自己看到喜欢的图就能收，不用等管理员给你放。'
+      + '只收**你最近在会话里真的看到过**的图（按 messageId 定位），不能传网址、不能读电脑上的其它文件。'
+      + '收藏本身不换头像，只是把图存下来；要换再调 qq_set_avatar。'
+      + '⚠️ 注意：如果这张图是别人拍的/画的有版权或隐私内容，别拿来做自己的头像。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌'),
+      messageId: z.union([z.number(), z.string()]).describe('那条带图的消情 id（来自 qq_get_recent_messages / qq_get_unread_messages 等）'),
+      imageIndex: z.number().int().min(0).optional().describe('这条消息里的第几张图，从 0 开始（一条消息有多张图时用，默认第 1 张）'),
+      name: z.string().optional().describe('存成什么名字（不带扩展名就行，会按实际格式补），例如 cat-meme'),
+    },
+    async ({ key, token, messageId, imageIndex, name }) => {
+      try {
+        const data = await agentApi('/api/socialV2/save-avatar', {
+          method: 'POST',
+          body: JSON.stringify({ key, messageId: String(messageId), imageIndex: imageIndex ?? 0, name: name || '' }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 90000
+        });
+        return {
+          content: [{
+            type: 'text',
+            text: `已收藏为头像素材：avatar/${data?.file}（${Math.round((data?.bytes ?? 0) / 1024)} KB）。想用就调 qq_set_avatar。`
+          }]
+        };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `收藏失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_set_avatar',
+    '改**机器人自己的** QQ 头像（立刻生效，所有好友群友都能看到）。只在管理员本人私聊里可用。'
+      + '你可以自己决定用哪个头像：不用每次换都问，觉得该换（换了心情、季节变了、想换个表情/风格）就换，这本来就是你自己的门面。'
+      + '但要克制：真人不会一天换好几次，同一个头像至少用几天再说，别把它当成随手动作。'
+      + '⚠️ 不可逆：旧头像换不回来，所以别乱试；要换就换个你真觉得合适的。'
+      + '图片必须已经在项目根目录的 avatar/ 文件夹里（你只能从里面挑，不能自己造图，也不能指到别处的文件）。',
+    {
+      key: z.string().describe('会话 key（必须是管理员私聊 private:<ownerQQ>）'),
+      token: z.string().describe('会话令牌'),
+      file: z.string().describe('avatar/ 目录下的图片文件名，例如 xiaojingyu.png'),
+    },
+    async ({ key, token, file }) => {
+      try {
+        const auth = isOwnerPrivate(key);
+        if (!auth.ok) return { content: [{ type: 'text', text: auth.error }], isError: true };
+        const data = await agentApi('/api/socialV2/set-avatar', {
+          method: 'POST',
+          body: JSON.stringify({ key, file: String(file) }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 90000
+        });
+        return { content: [{ type: 'text', text: `头像已改为 avatar/${data?.file ?? file}（${Math.round((data?.bytes ?? 0) / 1024)} KB）` }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `改头像失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+
+if (cfg.socialV2?.tools?.bili === true) {
+  server.tool(
+    'qq_bili',
+    '解析 B 站视频链接：拿到标题、UP主、播放/点赞/投币/收藏/评论/弹幕数，以及封面图。'
+      + '群里有人发 BV 号、av 号或 b23.tv 短链时用。'
+      + '返回里 text 是要发出去的文本，cover 是封面地址（想发封面就用 qq_send_avatar 之外的图片工具，或直接把它交给桥接发送）。'
+      + '同会话 20 秒内只能解析一次，碰到限流就老实说"刚看过一个，等下再试"。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌'),
+      text: z.string().describe('包含 B 站链接或 BV/av 号的原文'),
+    },
+    async ({ key, token, text }) => {
+      try {
+        const data = await agentApi('/api/socialV2/bili', {
+          method: 'POST',
+          body: JSON.stringify({ key, text: String(text) }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 60000
+        });
+        if (data?.parsed === false) {
+          return { content: [{ type: 'text', text: '这段文字里没找到 B 站视频号，不用回复。' }] };
+        }
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `解析失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.motou !== false) {
+  server.tool(
+    'qq_motou',
+    '生成「摸头」动图（petpet）并发出去：拿某个人的 QQ 头像做成被摸头的 GIF。'
+      + '群里有人说「摸摸头」「rua 一下」、或者你想逗某个人时用。'
+      + 'uin 传要摸谁（QQ 号）；不传就摸当前会话对象（私聊是对方，群聊需要明确指定）。'
+      + '同会话 10 秒只能做一次，碰到限流就老实说"刚摸过，等下再摸"。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌'),
+      uin: z.union([z.number(), z.string()]).optional().describe('要摸谁的 QQ 号（群聊建议明确指定；私聊可省略）'),
+    },
+    async ({ key, token, uin }) => {
+      try {
+        let target = uin;
+        if (target == null || String(target).trim() === '') {
+          const m = /^private:(\d+)$/.exec(String(key ?? '').trim());
+          if (!m) return { content: [{ type: 'text', text: '群聊里要指定 uin（摸谁）' }], isError: true };
+          target = m[1];
+        }
+        const data = await agentApi('/api/socialV2/motou', {
+          method: 'POST',
+          body: JSON.stringify({ key, uin: String(target) }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 60000
+        });
+        return { content: [{ type: 'text', text: `摸头图已发出（${Math.round((data?.bytes ?? 0) / 1024)} KB）` }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `摸头失败：${error?.message ?? error}` }], isError: true };
       }
     }
   );
